@@ -1,0 +1,388 @@
+"""
+Loan Default Prediction (Synthetic) - inspired by SBI FY2025 Annual Report
+
+This script generates a synthetic loan-level dataset using sector-wise NPA ratios
+inspired by SBI FY2025, simulates borrower attributes, builds a Logistic Regression
+baseline model to predict defaults, and evaluates it using ROC-AUC and classification
+metrics. It also computes a simple Expected Credit Loss (ECL) estimate as a demo.
+
+Tech stack: pandas, numpy, scikit-learn, matplotlib, seaborn
+
+Usage: run in a Jupyter notebook or as a script. If running as a notebook, split
+cells as needed. The script prints and plots EDA + model evaluation outputs.
+
+Future ideas: try RandomForest/XGBoost, calibrate probabilities, link to Basel/ECL
+
+Author: Generated for user request
+Date: 2025-09-10
+"""
+
+# Standard imports
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    average_precision_score,
+)
+from sklearn.ensemble import RandomForestClassifier
+
+# ---------------------------
+# 1) Synthetic data generator
+# ---------------------------
+
+def generate_synthetic_loans(
+    n=20000,
+    seed=42,
+    sector_distribution=None,
+    sector_npa=None,
+):
+    """Generate synthetic loan-level dataset.
+
+    Parameters
+    ----------
+    n : int
+        number of loans
+    seed : int
+        random seed
+    sector_distribution : dict
+        fraction of loans by sector
+    sector_npa : dict
+        observed NPA ratio per sector (as probability of default)
+
+    Returns
+    -------
+    pd.DataFrame
+        Synthetic loan dataset
+    """
+    np.random.seed(seed)
+
+    # Default sector distribution if not provided
+    if sector_distribution is None:
+        sector_distribution = {
+            "Agriculture": 0.15,
+            "Industry": 0.30,
+            "Services": 0.35,
+            "Personal": 0.20,
+        }
+
+    # Default sector NPA (these are illustrative and inspired by the problem statement)
+    if sector_npa is None:
+        # convert percent to probability
+        sector_npa = {
+            "Agriculture": 0.025,  # 2.5%
+            "Industry": 0.02,      # 2.0%
+            "Services": 0.015,     # 1.5%
+            "Personal": 0.03,      # 3.0%
+        }
+
+    sectors = list(sector_distribution.keys())
+    sector_probs = list(sector_distribution.values())
+
+    # draw sectors for each loan
+    loan_sector = np.random.choice(sectors, size=n, p=sector_probs)
+
+    # borrower attributes simulated with sector-based shifts
+    income = np.zeros(n)
+    credit_score = np.zeros(n)
+    loan_amount = np.zeros(n)
+    tenure_months = np.zeros(n, dtype=int)
+
+    for s in sectors:
+        idx = loan_sector == s
+        m = idx.sum()
+        if m == 0:
+            continue
+        # income: Personal loans lower incomes, Industry/Services higher
+        if s == "Personal":
+            income[idx] = np.random.lognormal(mean=10.2, sigma=0.6, size=m)
+            credit_score[idx] = np.random.normal(loc=600, scale=60, size=m)
+            loan_amount[idx] = np.random.normal(loc=200000, scale=50000, size=m)
+            tenure_months[idx] = np.random.randint(12, 84, size=m)
+        elif s == "Agriculture":
+            income[idx] = np.random.lognormal(mean=10.0, sigma=0.7, size=m)
+            credit_score[idx] = np.random.normal(loc=620, scale=70, size=m)
+            loan_amount[idx] = np.random.normal(loc=300000, scale=80000, size=m)
+            tenure_months[idx] = np.random.randint(12, 120, size=m)
+        elif s == "Industry":
+            income[idx] = np.random.lognormal(mean=11.3, sigma=0.8, size=m)
+            credit_score[idx] = np.random.normal(loc=660, scale=50, size=m)
+            loan_amount[idx] = np.random.normal(loc=1500000, scale=600000, size=m)
+            tenure_months[idx] = np.random.randint(24, 240, size=m)
+        elif s == "Services":
+            income[idx] = np.random.lognormal(mean=11.0, sigma=0.7, size=m)
+            credit_score[idx] = np.random.normal(loc=650, scale=55, size=m)
+            loan_amount[idx] = np.random.normal(loc=800000, scale=250000, size=m)
+            tenure_months[idx] = np.random.randint(12, 180, size=m)
+
+    # clamp/sanitize
+    income = np.clip(income, a_min=1000, a_max=None)
+    credit_score = np.clip(credit_score, a_min=300, a_max=900)
+    loan_amount = np.clip(loan_amount, a_min=5000, a_max=None)
+
+    # borrower age and existing loans
+    age = np.random.randint(21, 71, size=n)
+    existing_loans = np.random.poisson(lam=0.9, size=n)
+
+    # construct base probability of default (PD) influenced by credit score, income-to-loan ratio, tenure, sector base
+    income_to_loan = income / (loan_amount + 1)
+
+    # Normalize credit score to 0-1
+    cs_norm = (credit_score - 300) / (900 - 300)
+
+    # Sector base PD
+    sector_pd_map = np.array([sector_npa[s] for s in loan_sector])
+
+    # Create a logistic-like latent score
+    latent = (
+        -4.0  # baseline log-odds
+        + (0.0 + (0.8 * (1 - cs_norm)))  # worse credit score -> higher PD
+        + (1.5 * (1 - np.tanh(income_to_loan * 10)))  # small income_to_loan -> higher PD
+        + (0.003 * (tenure_months - 36))  # longer tenure small effect
+        + (0.25 * existing_loans)
+    )
+
+    # Shift latent so that sector-level mean PD approximates sector_pd_map mean
+    # We'll convert latent to prob via sigmoid and then calibrate per sector
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    base_pd = sigmoid(latent)
+
+    # Calibrate: for each sector, scale probabilities to match approx sector_npa
+    calibrated_pd = np.zeros_like(base_pd)
+    for s in sectors:
+        idx = loan_sector == s
+        if idx.sum() == 0:
+            continue
+        # current mean
+        cur_mean = base_pd[idx].mean()
+        target = sector_npa[s]
+        if cur_mean == 0:
+            scale = 0.0
+        else:
+            scale = target / cur_mean
+        # apply scaling and clip
+        calibrated_pd[idx] = np.clip(base_pd[idx] * scale, 0, 1)
+
+    # Finally draw defaults
+    defaults = np.random.binomial(n=1, p=calibrated_pd)
+
+    df = pd.DataFrame(
+        {
+            "sector": loan_sector,
+            "income": income,
+            "credit_score": credit_score.astype(int),
+            "loan_amount": loan_amount,
+            "tenure_months": tenure_months,
+            "age": age,
+            "existing_loans": existing_loans,
+            "pd_true": calibrated_pd,
+            "default": defaults,
+        }
+    )
+
+    # add a few derived features
+    df["income_to_loan"] = df["income"] / (df["loan_amount"] + 1)
+    df["debt_to_income"] = df["loan_amount"] / (df["income"] + 1)
+
+    return df
+
+
+# ---------------------------
+# 2) Generate dataset
+# ---------------------------
+
+if __name__ == "__main__":
+    # generate
+    df = generate_synthetic_loans(n=30000, seed=2025)
+    print("Generated dataset shape:", df.shape)
+    display_cols = ["sector", "income", "credit_score", "loan_amount", "tenure_months", "existing_loans", "default"]
+    print(df[display_cols].head())
+
+    # Quick sector-level checks (approx NPA rates)
+    sector_summary = df.groupby("sector").agg(
+        loans=("default", "count"),
+        defaults=("default", "sum"),
+        observed_npa=("default", "mean"),
+    ).reset_index()
+    print("\nSector summary (approx NPA):")
+    print(sector_summary)
+
+    # ---------------------------
+    # 3) Exploratory plots
+    # ---------------------------
+    plt.figure(figsize=(8, 5))
+    sns.countplot(data=df, x="sector")
+    plt.title("Loan counts by sector")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(8, 5))
+    sns.boxplot(data=df, x="sector", y="loan_amount")
+    plt.title("Loan amount distribution by sector")
+    plt.yscale("log")
+    plt.tight_layout()
+    plt.show()
+
+    # default rate by credit score bucket
+    df["cs_bucket"] = pd.cut(df["credit_score"], bins=[299, 550, 650, 700, 750, 900], labels=["<550", "550-650", "650-700", "700-750", ">=750"]) 
+    default_by_cs = df.groupby("cs_bucket")["default"].mean().reset_index()
+    print("\nDefault rate by credit score bucket:")
+    print(default_by_cs)
+
+    # ---------------------------
+    # 4) Prepare features for modeling
+    # ---------------------------
+    feature_cols = ["income", "credit_score", "loan_amount", "tenure_months", "age", "existing_loans", "income_to_loan", "debt_to_income"]
+    X = df[feature_cols].copy()
+    y = df["default"].copy()
+
+    # train/test split (stratify to keep default share)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, random_state=42, stratify=y
+    )
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # ---------------------------
+    # 5) Logistic Regression baseline
+    # ---------------------------
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+    clf.fit(X_train_scaled, y_train)
+
+    y_pred_proba = clf.predict_proba(X_test_scaled)[:, 1]
+    y_pred = clf.predict(X_test_scaled)
+
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    print(f"\nLogistic Regression ROC-AUC: {roc_auc:.4f}")
+    print("\nClassification report (test):")
+    print(classification_report(y_test, y_pred, digits=4))
+
+    # confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    print("Confusion matrix:\n", cm)
+
+    # ROC curve
+    fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+    plt.figure(figsize=(6, 5))
+    plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.4f}")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curve - Logistic Regression")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # ---------------------------
+    # 6) Feature coefficients
+    # ---------------------------
+    coef = pd.Series(clf.coef_[0], index=feature_cols).sort_values()
+    print("\nLogistic regression feature coefficients (sorted):")
+    print(coef)
+
+    plt.figure(figsize=(8, 4))
+    coef.plot(kind="barh")
+    plt.title("Logistic Regression Coefficients")
+    plt.tight_layout()
+    plt.show()
+
+    # ---------------------------
+    # 7) Calibration check and PR curve
+    # ---------------------------
+    avg_precision = average_precision_score(y_test, y_pred_proba)
+    print(f"Average precision (PR AUC): {avg_precision:.4f}")
+
+    precision, recall, pr_thresholds = precision_recall_curve(y_test, y_pred_proba)
+    plt.figure(figsize=(6, 5))
+    plt.plot(recall, precision)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve")
+    plt.tight_layout()
+    plt.show()
+
+    # ---------------------------
+    # 8) Quick Random Forest baseline (optional)
+    # ---------------------------
+    rf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+    rf.fit(X_train, y_train)
+    rf_proba = rf.predict_proba(X_test)[:, 1]
+    rf_auc = roc_auc_score(y_test, rf_proba)
+    print(f"\nRandom Forest ROC-AUC: {rf_auc:.4f}")
+
+    # feature importance
+    fi = pd.Series(rf.feature_importances_, index=feature_cols).sort_values(ascending=False)
+    print("\nRandom Forest feature importances:")
+    print(fi)
+
+    plt.figure(figsize=(8, 4))
+    fi.plot(kind="bar")
+    plt.title("Random Forest Feature Importances")
+    plt.tight_layout()
+    plt.show()
+
+    # ---------------------------
+    # 9) Simple Expected Credit Loss (ECL) demonstration
+    # ---------------------------
+    # ECL = PD * LGD * EAD. Here we create simple assumptions per sector.
+    sector_lgd_map = {
+        "Agriculture": 0.45,
+        "Industry": 0.40,
+        "Services": 0.38,
+        "Personal": 0.55,
+    }
+
+    # EAD: assume a fraction of loan_amount (e.g., outstanding balance). We use 90% for demonstration
+    df["EAD"] = df["loan_amount"] * 0.9
+    df["LGD"] = df["sector"].map(sector_lgd_map)
+
+    # Use predicted PD from logistic model applied to full dataset for demonstration
+    X_full_scaled = scaler.transform(df[feature_cols])
+    df["PD_model"] = clf.predict_proba(X_full_scaled)[:, 1]
+
+    df["ECL"] = df["PD_model"] * df["LGD"] * df["EAD"]
+
+    # Aggregate by sector
+    ecl_by_sector = df.groupby("sector")["ECL"].sum().reset_index().sort_values(by="ECL", ascending=False)
+    print("\nEstimated ECL by sector (demo values):")
+    print(ecl_by_sector)
+
+    # Overall ECL
+    total_ecl = df["ECL"].sum()
+    print(f"\nTotal portfolio ECL (demo): {total_ecl:,.2f}")
+
+    # ---------------------------
+    # 10) Save dataset and model outputs (optional)
+    # ---------------------------
+    try:
+        df.to_csv("synthetic_loan_dataset.csv", index=False)
+        print("Saved synthetic_loan_dataset.csv")
+    except Exception as e:
+        print("Could not save CSV:", e)
+
+    # save a simple model pickle
+    try:
+        import joblib
+
+        joblib.dump(clf, "logistic_default_model.joblib")
+        joblib.dump(scaler, "scaler.joblib")
+        print("Saved logistic_default_model.joblib and scaler.joblib")
+    except Exception as e:
+        print("Could not save models:", e)
+
+    # ---------------------------
+    # 11) Next steps suggestions (printed)
+    # ---------------------------
+    print("\nNext steps:\n- Try hyperparameter tuning and calibrated classifiers\n- Train ensemble models (XGBoost, LightGBM) and compare\n- Incorporate macroeconomic variables and time series of PDs\n- Link PD outputs to regulatory ECL and capital calculations\n")
